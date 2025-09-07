@@ -11,12 +11,13 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor
 import functools
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 import httpx
+import json
 
 # Configure logging with better formatting
 logging.basicConfig(
@@ -34,6 +35,7 @@ openai_client = None
 thread_pool = ThreadPoolExecutor(max_workers=4)
 transcription_cache = {}  # Simple in-memory cache
 client_session = None
+active_connections = []  # WebSocket connections for live transcription
 
 # Enhanced Request/Response models
 class TextRequest(BaseModel):
@@ -47,6 +49,12 @@ class TranscriptionResponse(BaseModel):
     confidence: Optional[float] = None
     processing_time: float
     cached: bool = False
+
+class LiveTranscriptionChunk(BaseModel):
+    text: str
+    timestamp: float
+    confidence: Optional[float] = None
+    is_final: bool = False
 
 class SummaryResponse(BaseModel):
     summary: str
@@ -312,12 +320,13 @@ async def root():
         "ai_provider": "OpenAI",
         "features": {
             "transcription": True,
+            "live_transcription": True,
             "summarization": True,
             "response_suggestions": True,
             "caching": True,
             "async_processing": True
         },
-        "endpoints": ["/health", "/transcribe", "/summarize", "/suggest_response"],
+        "endpoints": ["/health", "/transcribe", "/summarize", "/suggest_response", "/ws/live"],
         "docs": "/docs"
     }
 
@@ -346,9 +355,104 @@ async def health_check():
             "whisper_api": openai_client is not None,
             "text_generation": openai_client is not None,
             "thread_pool": not thread_pool._shutdown,
-            "cache": len(transcription_cache) > 0 if transcription_cache else True
+            "cache": len(transcription_cache) > 0 if transcription_cache else True,
+            "websocket_support": True
         }
     )
+
+# WebSocket endpoint for live transcription
+@app.websocket("/ws/live")
+async def websocket_live_transcription(websocket: WebSocket):
+    """WebSocket endpoint for live audio streaming and transcription"""
+    await websocket.accept()
+    active_connections.append(websocket)
+    
+    logger.info("🔴 Live transcription WebSocket connected")
+    
+    try:
+        audio_buffer = bytearray()
+        chunk_size = 16000 * 2 * 5  # 5 seconds of 16kHz mono audio
+        
+        while True:
+            # Receive audio data
+            data = await websocket.receive_bytes()
+            audio_buffer.extend(data)
+            
+            # Process when we have enough audio
+            if len(audio_buffer) >= chunk_size:
+                # Extract chunk
+                chunk = bytes(audio_buffer[:chunk_size])
+                audio_buffer = audio_buffer[chunk_size:]
+                
+                # Process chunk asynchronously
+                asyncio.create_task(process_live_chunk(websocket, chunk))
+                
+    except WebSocketDisconnect:
+        active_connections.remove(websocket)
+        logger.info("🔴 Live transcription WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        if websocket in active_connections:
+            active_connections.remove(websocket)
+
+async def process_live_chunk(websocket: WebSocket, audio_chunk: bytes):
+    """Process a live audio chunk and send transcription"""
+    if not openai_client:
+        await websocket.send_json({
+            "error": "Transcription service unavailable",
+            "timestamp": time.time()
+        })
+        return
+    
+    try:
+        start_time = time.time()
+        
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+            temp_file.write(audio_chunk)
+            temp_file_path = temp_file.name
+        
+        try:
+            # Transcribe with OpenAI Whisper - FIXED MODEL NAME
+            with open(temp_file_path, "rb") as file:
+                transcription_response = openai_client.audio.transcriptions.create(
+                    model="whisper-1",  # CORRECT MODEL NAME
+                    file=file,
+                    response_format="verbose_json",
+                    temperature=0.0
+                )
+            
+            processing_time = time.time() - start_time
+            
+            # Send transcription chunk
+            chunk_data = LiveTranscriptionChunk(
+                text=transcription_response.text.strip(),
+                timestamp=time.time(),
+                confidence=calculate_confidence(transcription_response.text),
+                is_final=True
+            )
+            
+            await websocket.send_json({
+                "type": "transcription",
+                "data": chunk_data.dict(),
+                "processing_time": processing_time
+            })
+            
+            logger.info(f"Live chunk processed in {processing_time:.2f}s: {len(transcription_response.text)} chars")
+            
+        finally:
+            # Cleanup temp file
+            try:
+                os.unlink(temp_file_path)
+            except Exception:
+                pass
+                
+    except Exception as e:
+        logger.error(f"Live chunk processing error: {e}")
+        await websocket.send_json({
+            "error": f"Processing failed: {str(e)}",
+            "timestamp": time.time()
+        })
 
 @app.post("/transcribe", response_model=TranscriptionResponse)
 async def transcribe_audio(
@@ -396,16 +500,15 @@ async def transcribe_audio(
             temp_file_path = temp_file.name
         
         try:
-            # OpenAI Whisper transcription
+            # OpenAI Whisper transcription - FIXED MODEL NAME
             logger.info("🔊 Starting OpenAI Whisper transcription...")
             
             with open(temp_file_path, "rb") as file:
                 transcription_response = openai_client.audio.transcriptions.create(
-                    model="gpt-4o-mini-transcribe",  # Using the specific transcription model
+                    model="whisper-1",  # CORRECT MODEL NAME
                     file=file,
                     response_format="verbose_json",
-                    temperature=0.0,
-                    language="en"
+                    temperature=0.0
                 )
             
             # Process transcription result
@@ -648,41 +751,19 @@ async def suggest_response(request: TextRequest):
         
         logger.info(f"💭 Generating response suggestion for {len(text)} characters")
         
-        # Try using OpenAI's response generation if available, fallback to chat completion
-        try:
-            # Using OpenAI's responses API if available
-            response = openai_client.responses.create(
-                model="gpt-4o-mini",
-                reasoning={"effort": "low"},
-                instructions="""You are a professional meeting assistant. Analyze the meeting transcript and provide:
-1. Identify the most recent question, request, or discussion point
-2. Provide a brief, professional response suggestion (1-3 sentences)
-3. Indicate your confidence level (High/Medium/Low)
-
-Format your response as:
-CONTEXT: [what you're responding to]
-SUGGESTION: [your suggested response]
-CONFIDENCE: [High/Medium/Low]""",
-                input=f"Meeting transcript:\n{text}"
-            )
-            
-            raw_response = response.output_text.strip()
-            
-        except AttributeError:
-            # Fallback to chat completion if responses API not available
-            messages = [
-                {
-                    "role": "system",
-                    "content": """You are a professional meeting assistant. Your task is to:
+        messages = [
+            {
+                "role": "system",
+                "content": """You are a professional meeting assistant. Your task is to:
 1. Identify the most recent question, request, or discussion point
 2. Provide a brief, professional response suggestion
 3. Indicate your confidence level (High/Medium/Low)
 
 Keep responses concise but complete (1-3 sentences). Be professional and contextually appropriate."""
-                },
-                {
-                    "role": "user",
-                    "content": f"""Analyze this meeting transcript and suggest a professional response to the most recent query or discussion point:
+            },
+            {
+                "role": "user",
+                "content": f"""Analyze this meeting transcript and suggest a professional response to the most recent query or discussion point:
 
 {text}
 
@@ -690,18 +771,18 @@ Provide your response in this format:
 CONTEXT: [what you're responding to]
 SUGGESTION: [your suggested response]
 CONFIDENCE: [High/Medium/Low]"""
-                }
-            ]
-            
-            response = openai_client.chat.completions.create(
-                messages=messages,
-                model="gpt-4o-mini",
-                max_tokens=400,
-                temperature=0.4,
-                top_p=0.9
-            )
-            
-            raw_response = response.choices[0].message.content.strip()
+            }
+        ]
+        
+        response = openai_client.chat.completions.create(
+            messages=messages,
+            model="gpt-4o-mini",
+            max_tokens=400,
+            temperature=0.4,
+            top_p=0.9
+        )
+        
+        raw_response = response.choices[0].message.content.strip()
         
         parsed_response = parse_response_suggestion(raw_response)
         
