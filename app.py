@@ -404,7 +404,8 @@ async def transcribe_audio(
                     model="gpt-4o-mini-transcribe",  # Using the specific transcription model
                     file=file,
                     response_format="verbose_json",
-                    temperature=0.0
+                    temperature=0.0,
+                    language="en"
                 )
             
             # Process transcription result
