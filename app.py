@@ -399,9 +399,9 @@ async def process_live_chunk(websocket: WebSocket, audio_chunk: bytes):
     try:
         start_time = time.time()
         
-        # Use BytesIO instead of temp file, set name for WebM format
+        # Use BytesIO instead of temp file, set name for Ogg format
         buffer = io.BytesIO(audio_chunk)
-        buffer.name = 'chunk.webm'  # Hardcoded for live recordings (WebM/Opus)
+        buffer.name = 'chunk.ogg'  # Changed to ogg
         
         # Transcribe with OpenAI Whisper
         transcription_response = openai_client.audio.transcriptions.create(
