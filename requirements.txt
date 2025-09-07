@@ -13,3 +13,5 @@ gunicorn
 redis
 uvloop  # Unix only - faster event loop
 httptools  # Faster HTTP parsing
+pydub
+ffmpeg-python
