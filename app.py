@@ -10,7 +10,6 @@ from typing import Optional, Dict, Any
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 import functools
-
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -18,6 +17,8 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 import httpx
 import json
+# Add to imports
+from pydub import AudioSegment
 
 # Configure logging with better formatting
 logging.basicConfig(
@@ -258,8 +259,33 @@ def validate_audio_file(content_type: str, file_size: int, filename: str = "") -
     
     return False, f"Unsupported format: {content_type}"
 
-# Removed convert_audio_optimized since it requires pydub + FFmpeg, which may not be available on Render.com.
-# Instead, keep original bytes and set correct extension based on content_type.
+# Add this function
+def convert_audio_format(audio_bytes: bytes, input_format: str) -> bytes:
+    """Convert audio to WAV format for OpenAI compatibility"""
+    try:
+        # Create temporary files
+        with tempfile.NamedTemporaryFile(suffix=f'.{input_format}', delete=False) as input_temp:
+            input_temp.write(audio_bytes)
+            input_path = input_temp.name
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as output_temp:
+            output_path = output_temp.name
+        # Convert using pydub
+        audio = AudioSegment.from_file(input_path, format=input_format)
+        audio = audio.set_frame_rate(16000).set_channels(1)
+        audio.export(output_path, format="wav", parameters=["-ac", "1", "-ar", "16000"])
+        
+        # Read converted audio
+        with open(output_path, 'rb') as f:
+            converted_audio = f.read()
+        
+        # Cleanup
+        os.unlink(input_path)
+        os.unlink(output_path)
+        
+        return converted_audio
+    except Exception as e:
+        logger.error(f"Audio conversion failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Audio conversion error: {str(e)}")
 
 # Async wrapper for CPU-intensive operations
 def run_in_thread(func):
@@ -450,6 +476,7 @@ async def process_live_chunk(websocket: WebSocket, audio_chunk: bytes):
             "timestamp": time.time()
         })
 
+# Update the transcribe_audio endpoint
 @app.post("/transcribe", response_model=TranscriptionResponse)
 async def transcribe_audio(
     audio: UploadFile = File(..., description="Audio file for transcription"),
@@ -483,16 +510,20 @@ async def transcribe_audio(
         
         logger.info(f"🎵 Processing audio: {audio.filename} ({len(audio_bytes)} bytes)")
         
-        # Process audio in thread pool (sets correct format)
-        processed_audio, audio_format = await process_audio_sync(
-            audio_bytes, 
-            audio.content_type or "", 
-            audio.filename or ""
-        )
+        # Convert audio to WAV format
+        input_format = audio.filename.split('.')[-1] if audio.filename else 'webm'
+        try:
+            audio_bytes = convert_audio_format(audio_bytes, input_format)
+            logger.info("✅ Audio converted to WAV format")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"❌ Audio conversion failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Audio conversion error: {str(e)}")
         
-        # Use BytesIO with correct name/extension
-        buffer = io.BytesIO(processed_audio)
-        buffer.name = f"audio.{audio_format}"
+        # Use BytesIO with .wav extension
+        buffer = io.BytesIO(audio_bytes)
+        buffer.name = 'audio.wav'
         
         # OpenAI Whisper transcription
         logger.info("🔊 Starting OpenAI Whisper transcription...")
@@ -637,15 +668,12 @@ async def summarize_text(request: TextRequest):
 2. Key discussion points as bullet points  
 3. Clear action items with owners if mentioned
 4. Important decisions made
-
 Keep summaries professional and actionable."""
             },
             {
                 "role": "user", 
                 "content": f"""Analyze this meeting transcript and provide a structured summary:
-
 {text}
-
 Format your response as:
 SUMMARY: [2-3 sentence overview]
 KEY POINTS: [bullet points of main discussion items]
@@ -744,15 +772,12 @@ async def suggest_response(request: TextRequest):
 1. Identify the most recent question, request, or discussion point
 2. Provide a brief, professional response suggestion
 3. Indicate your confidence level (High/Medium/Low)
-
 Keep responses concise but complete (1-3 sentences). Be professional and contextually appropriate."""
             },
             {
                 "role": "user",
                 "content": f"""Analyze this meeting transcript and suggest a professional response to the most recent query or discussion point:
-
 {text}
-
 Provide your response in this format:
 CONTEXT: [what you're responding to]
 SUGGESTION: [your suggested response]
