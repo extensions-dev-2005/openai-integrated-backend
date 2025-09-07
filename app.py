@@ -258,28 +258,8 @@ def validate_audio_file(content_type: str, file_size: int, filename: str = "") -
     
     return False, f"Unsupported format: {content_type}"
 
-def convert_audio_optimized(audio_bytes: bytes, target_format: str = "wav") -> bytes:
-    """Optimized audio conversion using pydub"""
-    try:
-        from pydub import AudioSegment
-        
-        # Load with automatic format detection
-        audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
-        
-        # Optimize for transcription: 16kHz mono (optional for OpenAI)
-        audio = audio.set_frame_rate(16000).set_channels(1)
-        
-        # Export to target format
-        output_buffer = io.BytesIO()
-        audio.export(output_buffer, format=target_format)
-        
-        converted = output_buffer.getvalue()
-        logger.info(f"Audio converted: {len(audio_bytes)} -> {len(converted)} bytes")
-        return converted
-        
-    except Exception as e:
-        logger.warning(f"Conversion failed: {e}, using original")
-        return audio_bytes
+# Removed convert_audio_optimized since it requires pydub + FFmpeg, which may not be available on Render.com.
+# Instead, keep original bytes and set correct extension based on content_type.
 
 # Async wrapper for CPU-intensive operations
 def run_in_thread(func):
@@ -299,12 +279,24 @@ def process_audio_sync(audio_bytes: bytes, content_type: str, filename: str) -> 
         if not is_valid:
             raise ValueError(msg)
         
-        # Convert if needed (optional for OpenAI as it accepts many formats)
-        if content_type not in ['audio/wav', 'audio/mp3', 'audio/m4a']:
-            audio_bytes = convert_audio_optimized(audio_bytes)
-            return audio_bytes, "wav"
+        # Map content_type to file extension
+        format_map = {
+            'audio/webm': 'webm',
+            'audio/wav': 'wav',
+            'audio/mp3': 'mp3',
+            'audio/m4a': 'm4a',
+            'audio/ogg': 'ogg',
+            'audio/flac': 'flac',
+            'audio/mpeg': 'mpeg',
+            'audio/mp4': 'mp4',
+            'audio/mpga': 'mpga'
+        }
         
-        return audio_bytes, "mp3" if content_type == 'audio/mp3' else "wav"
+        audio_format = format_map.get(content_type, 'webm')  # Default to webm for unknown (common for recordings)
+        
+        # No conversion attempted here to avoid FFmpeg dependency issues
+        logger.info(f"Using original audio format: {audio_format}")
+        return audio_bytes, audio_format
     except Exception as e:
         logger.error(f"Audio processing failed: {e}")
         raise
@@ -407,45 +399,35 @@ async def process_live_chunk(websocket: WebSocket, audio_chunk: bytes):
     try:
         start_time = time.time()
         
-        # Create temporary file
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-            temp_file.write(audio_chunk)
-            temp_file_path = temp_file.name
+        # Use BytesIO instead of temp file, set name for WebM format
+        buffer = io.BytesIO(audio_chunk)
+        buffer.name = 'chunk.webm'  # Hardcoded for live recordings (WebM/Opus)
         
-        try:
-            # Transcribe with OpenAI Whisper - FIXED MODEL NAME
-            with open(temp_file_path, "rb") as file:
-                transcription_response = openai_client.audio.transcriptions.create(
-                    model="whisper-1",  # CORRECT MODEL NAME
-                    file=file,
-                    response_format="verbose_json",
-                    temperature=0.0
-                )
+        # Transcribe with OpenAI Whisper
+        transcription_response = openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=buffer,
+            response_format="verbose_json",
+            temperature=0.0
+        )
             
-            processing_time = time.time() - start_time
+        processing_time = time.time() - start_time
             
-            # Send transcription chunk
-            chunk_data = LiveTranscriptionChunk(
-                text=transcription_response.text.strip(),
-                timestamp=time.time(),
-                confidence=calculate_confidence(transcription_response.text),
-                is_final=True
-            )
+        # Send transcription chunk
+        chunk_data = LiveTranscriptionChunk(
+            text=transcription_response.text.strip(),
+            timestamp=time.time(),
+            confidence=calculate_confidence(transcription_response.text),
+            is_final=True
+        )
             
-            await websocket.send_json({
-                "type": "transcription",
-                "data": chunk_data.dict(),
-                "processing_time": processing_time
-            })
+        await websocket.send_json({
+            "type": "transcription",
+            "data": chunk_data.dict(),
+            "processing_time": processing_time
+        })
             
-            logger.info(f"Live chunk processed in {processing_time:.2f}s: {len(transcription_response.text)} chars")
-            
-        finally:
-            # Cleanup temp file
-            try:
-                os.unlink(temp_file_path)
-            except Exception:
-                pass
+        logger.info(f"Live chunk processed in {processing_time:.2f}s: {len(transcription_response.text)} chars")
                 
     except Exception as e:
         logger.error(f"Live chunk processing error: {e}")
@@ -487,63 +469,53 @@ async def transcribe_audio(
         
         logger.info(f"🎵 Processing audio: {audio.filename} ({len(audio_bytes)} bytes)")
         
-        # Process audio in thread pool
+        # Process audio in thread pool (sets correct format)
         processed_audio, audio_format = await process_audio_sync(
             audio_bytes, 
             audio.content_type or "", 
             audio.filename or ""
         )
         
-        # Create temporary file for OpenAI API
-        with tempfile.NamedTemporaryFile(suffix=f'.{audio_format}', delete=False) as temp_file:
-            temp_file.write(processed_audio)
-            temp_file_path = temp_file.name
+        # Use BytesIO with correct name/extension
+        buffer = io.BytesIO(processed_audio)
+        buffer.name = f"audio.{audio_format}"
         
-        try:
-            # OpenAI Whisper transcription - FIXED MODEL NAME
-            logger.info("🔊 Starting OpenAI Whisper transcription...")
+        # OpenAI Whisper transcription
+        logger.info("🔊 Starting OpenAI Whisper transcription...")
+        
+        transcription_response = openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=buffer,
+            response_format="verbose_json",
+            temperature=0.0
+        )
             
-            with open(temp_file_path, "rb") as file:
-                transcription_response = openai_client.audio.transcriptions.create(
-                    model="whisper-1",  # CORRECT MODEL NAME
-                    file=file,
-                    response_format="verbose_json",
-                    temperature=0.0
-                )
+        # Process transcription result
+        raw_text = transcription_response.text.strip() if transcription_response.text else ""
             
-            # Process transcription result
-            raw_text = transcription_response.text.strip() if transcription_response.text else ""
+        # Enhanced text cleaning
+        cleaned_text = clean_transcription_text(raw_text)
             
-            # Enhanced text cleaning
-            cleaned_text = clean_transcription_text(raw_text)
+        processing_time = time.time() - start_time
             
-            processing_time = time.time() - start_time
+        result = {
+            'text': cleaned_text,
+            'duration': getattr(transcription_response, 'duration', None),
+            'language': getattr(transcription_response, 'language', None),
+            'confidence': calculate_confidence(cleaned_text),
+            'processing_time': processing_time,
+            'cached': False
+        }
             
-            result = {
-                'text': cleaned_text,
-                'duration': getattr(transcription_response, 'duration', None),
-                'language': getattr(transcription_response, 'language', None),
-                'confidence': calculate_confidence(cleaned_text),
-                'processing_time': processing_time,
-                'cached': False
-            }
+        # Cache result
+        cache_transcription(cache_key, result)
             
-            # Cache result
-            cache_transcription(cache_key, result)
+        # Schedule cache cleanup
+        if background_tasks:
+            background_tasks.add_task(cleanup_cache)
             
-            # Schedule cache cleanup
-            if background_tasks:
-                background_tasks.add_task(cleanup_cache)
-            
-            logger.info(f"✅ Transcription completed in {processing_time:.2f}s")
-            return TranscriptionResponse(**result)
-            
-        finally:
-            # Cleanup temp file
-            try:
-                os.unlink(temp_file_path)
-            except Exception as e:
-                logger.warning(f"Temp file cleanup failed: {e}")
+        logger.info(f"✅ Transcription completed in {processing_time:.2f}s")
+        return TranscriptionResponse(**result)
         
     except HTTPException:
         raise
