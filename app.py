@@ -390,6 +390,7 @@ async def websocket_live_transcription(websocket: WebSocket):
 async def process_live_chunk(websocket: WebSocket, audio_chunk: bytes):
     """Process a live audio chunk and send transcription"""
     if not openai_client:
+        logger.error("OpenAI client not initialized")
         await websocket.send_json({
             "error": "Transcription service unavailable",
             "timestamp": time.time()
@@ -398,21 +399,34 @@ async def process_live_chunk(websocket: WebSocket, audio_chunk: bytes):
     
     try:
         start_time = time.time()
+        logger.debug(f"Received audio chunk of size {len(audio_chunk)} bytes")
         
-        # Use BytesIO instead of temp file, set name for Ogg format
+        # Validate chunk size
+        if len(audio_chunk) < 1000:
+            logger.warning("Audio chunk too small, skipping transcription")
+            await websocket.send_json({
+                "error": "Audio chunk too small",
+                "timestamp": time.time()
+            })
+            return
+        
+        # Use BytesIO with .webm extension
         buffer = io.BytesIO(audio_chunk)
-        buffer.name = 'chunk.ogg'  # Changed to ogg
+        buffer.name = 'chunk.webm'
+        logger.debug(f"Processing chunk as webm, buffer size: {buffer.getbuffer().nbytes}")
         
         # Transcribe with OpenAI Whisper
+        logger.debug("Sending chunk to OpenAI Whisper API")
         transcription_response = openai_client.audio.transcriptions.create(
             model="whisper-1",
             file=buffer,
             response_format="verbose_json",
             temperature=0.0
         )
-            
+        
         processing_time = time.time() - start_time
-            
+        logger.info(f"Transcription completed in {processing_time:.2f}s, text length: {len(transcription_response.text)}")
+        
         # Send transcription chunk
         chunk_data = LiveTranscriptionChunk(
             text=transcription_response.text.strip(),
@@ -420,17 +434,17 @@ async def process_live_chunk(websocket: WebSocket, audio_chunk: bytes):
             confidence=calculate_confidence(transcription_response.text),
             is_final=True
         )
-            
+        
         await websocket.send_json({
             "type": "transcription",
             "data": chunk_data.dict(),
             "processing_time": processing_time
         })
-            
-        logger.info(f"Live chunk processed in {processing_time:.2f}s: {len(transcription_response.text)} chars")
+        
+        logger.debug(f"Sent transcription: {chunk_data.text[:50]}...")
                 
     except Exception as e:
-        logger.error(f"Live chunk processing error: {e}")
+        logger.error(f"Live chunk processing error: {str(e)}", exc_info=True)
         await websocket.send_json({
             "error": f"Processing failed: {str(e)}",
             "timestamp": time.time()
