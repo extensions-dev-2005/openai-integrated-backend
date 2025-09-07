@@ -401,7 +401,7 @@ async def transcribe_audio(
 
             with open(temp_file_path, "rb") as file:
                 transcription_response = openai_client.audio.transcriptions.create(
-                    model="gpt-4o-mini-transcribe",  # Using the specific transcription model
+                    model="whisper-1",  # Using the specific transcription model
                     file=file,
                     response_format="verbose_json",
                     temperature=0.0,
